@@ -113,18 +113,5 @@ python analytics.py                     # test pattern statistics
 python rag_graph.py "your question"     # ask a question (build vectorstore first)
 ```
 
-## 🗺️ Roadmap / ideas for extending
 
-- [ ] Multi-turn conversation memory in the Q&A tab (LangGraph checkpointing)
-- [ ] GraphRAG: extract entities/topics per day for multi-hop questions
-- [ ] Evaluation harness (e.g. RAGAS) to measure retrieval precision / answer faithfulness
-- [ ] Swap in a dedicated multilingual/Hinglish transformer sentiment model for comparison
-- [ ] Support for Telegram/Signal/iMessage exports
 
-## 📄 License
-
-MIT — free to use, modify, and build on.
-
-## ⚖️ Disclaimer
-
-This tool is intended for personal reflection and educational/portfolio purposes. It does not provide clinical, psychological, or relationship advice. Always obtain consent before analyzing conversations involving other people.
