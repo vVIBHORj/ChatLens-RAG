@@ -1,0 +1,9 @@
+langchain-core
+langchain-ollama
+langchain-chroma
+langgraph
+chromadb
+vaderSentiment
+pandas
+streamlit
+plotly
