@@ -89,6 +89,13 @@ def parse_whatsapp_export(filepath: str) -> List[ChatMessage]:
             continue
 
         match = LINE_PATTERN.match(line)
+        # Sender names are short by convention; a very long "sender" capture
+        # (e.g. > 60 chars) almost always means the line had no real sender
+        # and the regex grabbed message text up to some unrelated colon
+        # (a URL, a timestamp, etc). Treat that case as unmatched so it falls
+        # through to the system-line pattern or continuation handling below.
+        if match and len(match.group("sender").strip()) > 60:
+            match = None
         if match:
             dt = _parse_datetime(match.group("date"), match.group("time"))
             sender = match.group("sender").strip()
