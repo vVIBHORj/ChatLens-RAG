@@ -8,6 +8,8 @@ Requires a running local Ollama instance:
     ollama pull mxbai-embed-large
 """
 
+import shutil
+from pathlib import Path
 from typing import List
 from collections import defaultdict
 
@@ -65,8 +67,23 @@ def build_daily_chunks(enriched: List[EnrichedMessage]) -> List[Document]:
     return documents
 
 
-def build_vectorstore(documents: List[Document], persist_dir: str = PERSIST_DIR) -> Chroma:
-    embeddings = OllamaEmbeddings(model="mxbai-embed-large")
+def build_vectorstore(
+    documents: List[Document],
+    persist_dir: str = PERSIST_DIR,
+    reset: bool = True,
+) -> Chroma:
+    """Embed documents into a Chroma collection.
+
+    reset=True (default) wipes any existing persisted collection first. This
+    matters because each app run processes a single chat export -- without a
+    reset, re-uploading a new/different export would silently accumulate
+    into the same collection as a previous run, so RAG answers could be
+    grounded in the wrong conversation's chunks.
+    """
+    if reset and Path(persist_dir).exists():
+        shutil.rmtree(persist_dir)
+
+    embeddings = OllamaEmbeddings(model="qwen3-embedding:0.6b")
     vectorstore = Chroma.from_documents(
         documents=documents,
         embedding=embeddings,
@@ -77,7 +94,7 @@ def build_vectorstore(documents: List[Document], persist_dir: str = PERSIST_DIR)
 
 
 def load_vectorstore(persist_dir: str = PERSIST_DIR) -> Chroma:
-    embeddings = OllamaEmbeddings(model="mxbai-embed-large")
+    embeddings = OllamaEmbeddings(model="qwen3-embedding:0.6b")
     return Chroma(
         collection_name=COLLECTION_NAME,
         embedding_function=embeddings,
