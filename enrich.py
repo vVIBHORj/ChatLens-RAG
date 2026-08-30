@@ -59,7 +59,6 @@ def enrich_messages(messages: List[ChatMessage]) -> List[EnrichedMessage]:
 
         # reply_time: minutes since the OTHER sender last spoke (proxy for "did they leave me on read")
         reply_time = None
-        other_last = last_sender_timestamp.get(m.sender)
         # find timestamp of the most recent message from a different sender
         for s, ts in last_sender_timestamp.items():
             if s != m.sender and ts is not None:
