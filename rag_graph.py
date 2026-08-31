@@ -14,16 +14,19 @@ Requires a running local Ollama instance:
     ollama pull mxbai-embed-large
 """
 
-from typing import List, TypedDict
+from typing import List, Optional, TypedDict
 
+import pandas as pd
 from langchain_ollama import ChatOllama
 from langchain_core.documents import Document
 from langgraph.graph import StateGraph, END
 
 from vectorstore import load_vectorstore
+from analytics import build_style_profile
+
 
 MAX_REWRITES = 2
-llm = ChatOllama(model="llama3.2", temperature=0)
+llm = ChatOllama(model="qwen2.5:3b", temperature=0)
 
 
 class GraphState(TypedDict):
@@ -33,15 +36,206 @@ class GraphState(TypedDict):
     generation: str
     rewrite_count: int
     grounded: bool
+    df: Optional[pd.DataFrame]
+    scope: str
 
 
 # ---------- Nodes ----------
 
+def classify_scope(state: GraphState) -> GraphState:
+    """Decide whether this question needs a WHOLE-conversation view or can
+    be answered from a few semantically retrieved chunks.
+
+    'broad' = personality/communication-style/overall-pattern/general-tone
+    questions -- these bypass vector retrieval entirely and use a profile
+    built from real stats + samples spanning the full conversation.
+    'specific' = a particular fact, date, or exact thing said -- these use
+    the existing retrieve -> grade -> generate pipeline, which is the right
+    tool when the answer really does live in one or two chunks.
+    """
+    prompt = (
+        "Classify the following question about a chat conversation as "
+        "exactly one word: 'broad' or 'specific'.\n\n"
+        "'broad' = asking about overall patterns, personality, communication "
+        "style, general mood or tone, or anything spanning the whole "
+        "conversation rather than one moment in it.\n"
+        "'specific' = asking about a particular fact, date, event, plan, or "
+        "an exact thing someone said.\n\n"
+        f"Question: {state['question']}\n\n"
+        "Answer with exactly one word:"
+    )
+    response = llm.invoke(prompt).content.strip().lower()
+    scope = "broad" if "broad" in response else "specific"
+    return {**state, "scope": scope}
+
+
+def build_profile_context(state: GraphState) -> GraphState:
+    """For broad questions: wrap the whole-conversation stats profile as a
+    single synthetic Document so it flows through the existing
+    generate/check_grounded nodes unchanged."""
+    df = state.get("df")
+    if df is None or df.empty:
+        return {**state, "documents": []}
+
+    profile_text = build_style_profile(df)
+    doc = Document(
+        page_content=profile_text,
+        metadata={"source": "whole_conversation_profile"},
+    )
+    return {**state, "documents": [doc]}
+def expand_document_context(
+    document: Document,
+    before: int = 10,
+    after: int = 10,
+) -> Document:
+    """
+    Expand a retrieved Chroma document using the original messages
+    stored in SQLite.
+
+    Chroma = locator.
+    SQLite = source of truth.
+    """
+
+    metadata = document.metadata
+
+    start_message_id = metadata.get(
+        "start_message_id"
+    )
+
+    end_message_id = metadata.get(
+        "end_message_id"
+    )
+
+    if (
+        start_message_id is None
+        or end_message_id is None
+    ):
+        return document
+
+    start_message_id = int(
+        start_message_id
+    )
+
+    end_message_id = int(
+        end_message_id
+    )
+
+    # -------------------------------------------------------------
+    # Expand around the center/range of the retrieved chunk.
+    #
+    # We retrieve:
+    #
+    #   chunk start - before
+    #
+    # through
+    #
+    #   chunk end + after
+    # -------------------------------------------------------------
+
+    from chat_database import get_message_range
+
+    rows = get_message_range(
+        max(0, start_message_id - before),
+        end_message_id + after,
+    )
+
+    if not rows:
+        return document
+
+    # -------------------------------------------------------------
+    # Build transcript
+    # -------------------------------------------------------------
+
+    lines = []
+
+    for row in rows:
+
+        timestamp = row["timestamp"]
+
+        try:
+
+            from datetime import datetime
+
+            dt = datetime.fromisoformat(
+                timestamp
+            )
+
+            time_str = dt.strftime(
+                "%d/%m/%Y %I:%M %p"
+            )
+
+        except Exception:
+
+            time_str = timestamp
+
+        sender = row["sender"]
+
+        message = row["message"]
+
+        lines.append(
+            f"[ID {row['id']}] "
+            f"[{time_str}] "
+            f"{sender}: "
+            f"{message}"
+        )
+
+    expanded_transcript = "\n".join(
+        lines
+    )
+
+    # -------------------------------------------------------------
+    # Metadata
+    # -------------------------------------------------------------
+
+    new_metadata = dict(metadata)
+
+    new_metadata[
+        "expanded_start_message_id"
+    ] = max(
+        0,
+        start_message_id - before,
+    )
+
+    new_metadata[
+        "expanded_end_message_id"
+    ] = end_message_id + after
+
+    new_metadata[
+        "context_expanded"
+    ] = True
+
+    return Document(
+        page_content=expanded_transcript,
+        metadata=new_metadata,
+    )
+
+
+
 def retrieve(state: GraphState) -> GraphState:
+    """
+    Retrieve a larger candidate pool from Chroma.
+
+    We intentionally retrieve more candidates than we ultimately
+    send to the LLM. Later steps will rerank and expand the best
+    candidates.
+    """
+
     vectorstore = load_vectorstore()
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-    docs = retriever.invoke(state["question"])
-    return {**state, "documents": docs}
+
+    retriever = vectorstore.as_retriever(
+        search_kwargs={
+            "k": 15
+        }
+    )
+
+    docs = retriever.invoke(
+        state["question"]
+    )
+
+    return {
+        **state,
+        "documents": docs
+    }
 
 
 def grade_documents(state: GraphState) -> GraphState:
@@ -93,10 +287,29 @@ def rewrite_query(state: GraphState) -> GraphState:
 
 def generate(state: GraphState) -> GraphState:
     context = "\n\n---\n\n".join(d.page_content for d in state["documents"])
+    is_profile = any(d.metadata.get("source") == "whole_conversation_profile" for d in state["documents"])
+
+    if is_profile:
+        context_note = (
+            "The context below is a statistical profile covering the ENTIRE "
+            "conversation for each participant (computed from all their "
+            "messages, not a snippet), plus a few representative example "
+            "messages. Base your answer on these whole-conversation patterns."
+        )
+    else:
+        context_note = (
+            "The context below consists of relevant conversation sections "
+            "retrieved semantically and expanded with surrounding original "
+            "WhatsApp messages. The surrounding messages are provided to "
+            "preserve conversational context. Use them carefully and do not "
+            "assume that every message in the section is directly relevant."
+        )
+
     prompt = (
         "You are analyzing a WhatsApp chat history to answer a question about "
-        "the conversation. Use ONLY the context below. If the context doesn't "
-        "contain enough information, say so honestly instead of guessing.\n\n"
+        f"the conversation. {context_note} Use ONLY the context below. If the "
+        "context doesn't contain enough information, say so honestly instead "
+        "of guessing.\n\n"
         f"Context:\n{context}\n\n"
         f"Question: {state['original_question']}\n\n"
         "Answer:"
@@ -125,22 +338,64 @@ def check_grounded(state: GraphState) -> GraphState:
 
 # ---------- Build the graph ----------
 
+def route_by_scope(state: GraphState) -> str:
+    return "profile" if state["scope"] == "broad" else "retrieve"
+
+def expand_context(
+    state: GraphState,
+) -> GraphState:
+    """
+    Expand only the documents that survived relevance grading.
+    """
+
+    expanded_documents = []
+
+    for document in state["documents"]:
+
+        expanded_document = expand_document_context(
+            document,
+            before=10,
+            after=10,
+        )
+
+        expanded_documents.append(
+            expanded_document
+        )
+
+    return {
+        **state,
+        "documents": expanded_documents,
+    }
+
 def build_graph():
     workflow = StateGraph(GraphState)
-
+    
+    workflow.add_node("classify_scope", classify_scope)
+    workflow.add_node("build_profile_context", build_profile_context)
     workflow.add_node("retrieve", retrieve)
     workflow.add_node("grade_documents", grade_documents)
+    workflow.add_node("expand_context", expand_context)
     workflow.add_node("rewrite_query", rewrite_query)
     workflow.add_node("generate", generate)
     workflow.add_node("check_grounded", check_grounded)
 
-    workflow.set_entry_point("retrieve")
+    workflow.set_entry_point("classify_scope")
+    workflow.add_conditional_edges(
+        "classify_scope",
+        route_by_scope,
+        {"profile": "build_profile_context", "retrieve": "retrieve"},
+    )
+    workflow.add_edge("build_profile_context", "generate")
     workflow.add_edge("retrieve", "grade_documents")
     workflow.add_conditional_edges(
         "grade_documents",
         decide_to_generate,
-        {"generate": "generate", "rewrite_query": "rewrite_query"},
+        {
+            "generate": "expand_context",
+            "rewrite_query": "rewrite_query",
+        },
     )
+    workflow.add_edge("expand_context", "generate")
     workflow.add_edge("rewrite_query", "retrieve")
     workflow.add_edge("generate", "check_grounded")
     workflow.add_edge("check_grounded", END)
@@ -148,8 +403,14 @@ def build_graph():
     return workflow.compile()
 
 
-def ask(question: str) -> dict:
-    """Convenience wrapper: run the graph and return the answer + metadata."""
+def ask(question: str, df: Optional[pd.DataFrame] = None) -> dict:
+    """Convenience wrapper: run the graph and return the answer + metadata.
+
+    Pass the enriched messages DataFrame (df) so broad/holistic questions
+    can be answered from a whole-conversation profile instead of a handful
+    of retrieved chunks. If df is omitted, broad questions will fall back to
+    an empty profile and the model will say it lacks enough context.
+    """
     graph = build_graph()
     initial_state: GraphState = {
         "question": question,
@@ -158,6 +419,8 @@ def ask(question: str) -> dict:
         "generation": "",
         "rewrite_count": 0,
         "grounded": False,
+        "df": df,
+        "scope": "",
     }
     result = graph.invoke(initial_state)
     return {
@@ -165,16 +428,24 @@ def ask(question: str) -> dict:
         "grounded": result["grounded"],
         "sources": [d.metadata for d in result["documents"]],
         "rewrites_used": result["rewrite_count"],
+        "scope": result["scope"],
     }
 
 
 if __name__ == "__main__":
     import sys
 
+    from parser import parse_whatsapp_export
+    from enrich import enrich_messages, to_dataframe
+
     q = sys.argv[1] if len(sys.argv) > 1 else "How did our conversations change over time?"
+    msgs = parse_whatsapp_export("sample_chat.txt")
+    df = to_dataframe(enrich_messages(msgs))
+
     print(f"Q: {q}\n")
-    result = ask(q)
+    result = ask(q, df=df)
     print(f"A: {result['answer']}\n")
+    print(f"Scope: {result['scope']}")
     print(f"Grounded: {result['grounded']}")
     print(f"Rewrites used: {result['rewrites_used']}")
     print(f"Sources: {result['sources']}")

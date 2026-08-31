@@ -1,104 +1,343 @@
 """
-vectorstore.py
-Groups enriched messages into daily conversation "chunks" (single messages
-lack context for semantic search) and embeds them into a local Chroma vector
-store using mxbai-embed-large via Ollama.
+enrich.py
 
-Requires a running local Ollama instance:
-    ollama pull mxbai-embed-large
+Adds per-message metadata:
+    - stable message ID
+    - sentiment
+    - response time
+    - message length
+    - whether a message is a question
+
+VADER is used for fast local sentiment analysis.
 """
 
-from typing import List
-from collections import defaultdict
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import List, Optional
 
-from langchain_ollama import OllamaEmbeddings
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
+import pandas as pd
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-from enrich import EnrichedMessage
-
-PERSIST_DIR = "./chroma_db"
-COLLECTION_NAME = "whatsapp_chat"
+from parser import ChatMessage
 
 
-def build_daily_chunks(enriched: List[EnrichedMessage]) -> List[Document]:
-    """Group messages by calendar day into a single Document per day.
+_analyzer = SentimentIntensityAnalyzer()
 
-    Each Document's page_content is a readable transcript of that day's
-    conversation; metadata carries aggregate stats used for filtering /
-    for the analytics layer to cross-reference later.
+
+# ---------------------------------------------------------------------
+# Enriched message
+# ---------------------------------------------------------------------
+
+@dataclass
+class EnrichedMessage:
     """
-    by_day = defaultdict(list)
-    for m in enriched:
-        if not m.timestamp:
+    A parsed WhatsApp message with additional analysis metadata.
+    """
+
+    # Stable position/ID in the conversation
+    id: int
+
+    timestamp: Optional[datetime]
+    sender: Optional[str]
+    message: str
+    message_type: str
+
+    # Sentiment
+    sentiment_compound: float
+    sentiment_label: str
+
+    # Message characteristics
+    is_question: bool
+    message_length: int
+
+    # Timing
+    response_time_minutes: Optional[float]
+    reply_time_minutes: Optional[float]
+
+
+# ---------------------------------------------------------------------
+# Sentiment
+# ---------------------------------------------------------------------
+
+def _sentiment_label(compound: float) -> str:
+    """
+    Convert VADER compound score into a simple label.
+    """
+
+    if compound >= 0.05:
+        return "positive"
+
+    elif compound <= -0.05:
+        return "negative"
+
+    return "neutral"
+
+
+# ---------------------------------------------------------------------
+# Enrichment
+# ---------------------------------------------------------------------
+
+def enrich_messages(
+    messages: List[ChatMessage],
+) -> List[EnrichedMessage]:
+    """
+    Add analytical metadata to parsed WhatsApp messages.
+
+    Every message receives a stable sequential ID.
+
+    Important:
+        The ID represents the message's position in the parsed
+        conversation and will later allow us to retrieve neighboring
+        messages for context expansion.
+    """
+
+    enriched: List[EnrichedMessage] = []
+
+    last_timestamp: Optional[datetime] = None
+
+    # sender -> timestamp of their most recent message
+    last_sender_timestamp = {}
+
+    # -----------------------------------------------------------------
+    # Process messages
+    # -----------------------------------------------------------------
+
+    for message_id, m in enumerate(messages):
+
+        # -------------------------------------------------------------
+        # System messages
+        # -------------------------------------------------------------
+
+        if m.message_type == "system":
+
+            # System messages are retained by the parser but excluded
+            # from normal enrichment/semantic analysis.
+            last_timestamp = m.timestamp or last_timestamp
             continue
-        day_key = m.timestamp.date().isoformat()
-        by_day[day_key].append(m)
 
-    documents = []
-    for day, msgs in sorted(by_day.items()):
-        lines = []
-        sentiments = []
-        senders = set()
-        for m in msgs:
-            time_str = m.timestamp.strftime("%I:%M %p")
-            lines.append(f"[{time_str}] {m.sender}: {m.message}")
-            sentiments.append(m.sentiment_compound)
-            if m.sender:
-                senders.add(m.sender)
+        # -------------------------------------------------------------
+        # Sentiment
+        # -------------------------------------------------------------
 
-        transcript = "\n".join(lines)
-        avg_sentiment = sum(sentiments) / len(sentiments) if sentiments else 0.0
+        text = m.message or ""
 
-        documents.append(
-            Document(
-                page_content=transcript,
-                metadata={
-                    "date": day,
-                    "num_messages": len(msgs),
-                    "avg_sentiment": round(avg_sentiment, 4),
-                    "participants": ", ".join(sorted(senders)),
-                },
+        scores = _analyzer.polarity_scores(text)
+
+        compound = scores["compound"]
+
+        # -------------------------------------------------------------
+        # Response time
+        # -------------------------------------------------------------
+
+        response_time = None
+
+        if last_timestamp and m.timestamp:
+
+            response_time = (
+                m.timestamp - last_timestamp
+            ).total_seconds() / 60.0
+
+        # -------------------------------------------------------------
+        # Reply time
+        # -------------------------------------------------------------
+
+        reply_time = None
+
+        if m.timestamp and m.sender:
+
+            # Find the most recent message from another sender.
+            other_sender_timestamps = [
+                ts
+                for sender, ts in last_sender_timestamp.items()
+                if sender != m.sender and ts is not None
+            ]
+
+            if other_sender_timestamps:
+
+                most_recent_other_timestamp = max(
+                    other_sender_timestamps
+                )
+
+                reply_time = (
+                    m.timestamp - most_recent_other_timestamp
+                ).total_seconds() / 60.0
+
+        # -------------------------------------------------------------
+        # Create enriched message
+        # -------------------------------------------------------------
+
+        enriched.append(
+            EnrichedMessage(
+                id=message_id,
+
+                timestamp=m.timestamp,
+
+                sender=m.sender,
+
+                message=text,
+
+                message_type=m.message_type,
+
+                sentiment_compound=compound,
+
+                sentiment_label=_sentiment_label(compound),
+
+                is_question="?" in text,
+
+                message_length=len(text),
+
+                response_time_minutes=response_time,
+
+                reply_time_minutes=reply_time,
             )
         )
 
-    return documents
+        # -------------------------------------------------------------
+        # Update timing state
+        # -------------------------------------------------------------
+
+        last_timestamp = m.timestamp or last_timestamp
+
+        if m.sender and m.timestamp:
+
+            last_sender_timestamp[m.sender] = m.timestamp
+
+    return enriched
 
 
-def build_vectorstore(documents: List[Document], persist_dir: str = PERSIST_DIR) -> Chroma:
-    embeddings = OllamaEmbeddings(model="mxbai-embed-large")
-    vectorstore = Chroma.from_documents(
-        documents=documents,
-        embedding=embeddings,
-        collection_name=COLLECTION_NAME,
-        persist_directory=persist_dir,
+# ---------------------------------------------------------------------
+# DataFrame
+# ---------------------------------------------------------------------
+
+def to_dataframe(
+    enriched: List[EnrichedMessage],
+) -> pd.DataFrame:
+    """
+    Convert enriched messages into a pandas DataFrame.
+    """
+
+    return pd.DataFrame(
+        [asdict(message) for message in enriched]
     )
-    return vectorstore
 
 
-def load_vectorstore(persist_dir: str = PERSIST_DIR) -> Chroma:
-    embeddings = OllamaEmbeddings(model="mxbai-embed-large")
-    return Chroma(
-        collection_name=COLLECTION_NAME,
-        embedding_function=embeddings,
-        persist_directory=persist_dir,
-    )
-
+# ---------------------------------------------------------------------
+# Standalone test
+# ---------------------------------------------------------------------
 
 if __name__ == "__main__":
+
     from parser import parse_whatsapp_export
-    from enrich import enrich_messages
 
-    msgs = parse_whatsapp_export("sample_chat.txt")
+    print("=" * 60)
+    print("ChatLens-RAG Enrichment Test")
+    print("=" * 60)
+
+    # -------------------------------------------------------------
+    # Parse
+    # -------------------------------------------------------------
+
+    msgs = parse_whatsapp_export(
+        "sample_chat.txt"
+    )
+
+    print(
+        f"\nParsed messages: {len(msgs)}"
+    )
+
+    # -------------------------------------------------------------
+    # Enrich
+    # -------------------------------------------------------------
+
     enriched = enrich_messages(msgs)
-    docs = build_daily_chunks(enriched)
 
-    print(f"Built {len(docs)} daily chunks\n")
-    for d in docs:
-        print(f"--- {d.metadata['date']} (avg sentiment: {d.metadata['avg_sentiment']}) ---")
-        print(d.page_content)
-        print()
+    print(
+        f"Enriched messages: {len(enriched)}"
+    )
 
-    print("NOTE: building the actual Chroma vectorstore requires a running")
-    print("Ollama instance with 'mxbai-embed-large' pulled. Run this on your")
-    print("own machine, not in a sandbox without Ollama.")
+    # -------------------------------------------------------------
+    # Preview
+    # -------------------------------------------------------------
+
+    for message in enriched[:10]:
+
+        print("\n----------------------------------------")
+
+        print(
+            f"ID: {message.id}"
+        )
+
+        print(
+            f"Timestamp: {message.timestamp}"
+        )
+
+        print(
+            f"Sender: {message.sender}"
+        )
+
+        print(
+            f"Message: {message.message}"
+        )
+
+        print(
+            f"Type: {message.message_type}"
+        )
+
+        print(
+            f"Sentiment: {message.sentiment_label}"
+        )
+
+        print(
+            f"Sentiment score: "
+            f"{message.sentiment_compound}"
+        )
+
+        print(
+            f"Question: {message.is_question}"
+        )
+
+        print(
+            f"Response time: "
+            f"{message.response_time_minutes}"
+        )
+
+        print(
+            f"Reply time: "
+            f"{message.reply_time_minutes}"
+        )
+
+    # -------------------------------------------------------------
+    # DataFrame
+    # -------------------------------------------------------------
+
+    df = to_dataframe(enriched)
+
+    print("\n")
+    print("=" * 60)
+    print("DATAFRAME")
+    print("=" * 60)
+
+    pd.set_option(
+        "display.max_columns",
+        None,
+    )
+
+    pd.set_option(
+        "display.width",
+        200,
+    )
+
+    print(
+        df[
+            [
+                "id",
+                "timestamp",
+                "sender",
+                "message",
+                "sentiment_label",
+                "sentiment_compound",
+                "is_question",
+                "reply_time_minutes",
+            ]
+        ].head(10)
+    )
